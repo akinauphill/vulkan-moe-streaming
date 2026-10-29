@@ -496,7 +496,7 @@ index 9dcaf05..5e72f37 100644
  
  void llama_perf_context_reset(llama_context * ctx) {
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 23e4c90..de5ffe8 100644
+index 23e4c90..7a74fca 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -6,6 +6,7 @@
@@ -528,7 +528,7 @@ index 23e4c90..de5ffe8 100644
  
      if (prec_policy) {
          prec_policy->apply(res);
-@@ -2211,8 +2215,98 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2211,8 +2215,103 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
      //call early so that topk-moe can be used
      ggml_build_forward_expand(gf, weights);
  
@@ -583,12 +583,17 @@ index 23e4c90..de5ffe8 100644
 +    if (msl) {
 +        const uint64_t n_touch_max = std::min<uint64_t>((uint64_t) n_expert, (uint64_t) n_tokens*n_expert_used);
 +        if (n_touch_max > msl->n_slots) {
-+            // this wave's experts + the next wave's preloaded experts + n_expert_used parking slots
-+            stream_wave_cap = msl->n_slots > (uint32_t) n_expert_used ? (msl->n_slots - (uint32_t) n_expert_used)/2 : 0;
++            // this wave's experts + the next wave's preloaded experts + n_expert_used parking slots;
++            // with LLAMA_MOE_STREAM_WAVE_PRELOAD=0 the next wave loads synchronously and the floor drops
++            //   to 2*n_expert_used - for small-RAM hosts that trade a slower multi-wave path for a much
++            //   smaller expert cache
++            const uint32_t spare = msl->n_slots - (uint32_t) n_expert_used;
++            stream_wave_cap = spare > 0 ? (msl->mgr->wave_preload ? spare/2 : spare) : 0;
 +            if (stream_wave_cap < (uint32_t) n_expert_used) {
 +                GGML_ABORT("MoE expert streaming: multi-pass expert GEMMs need an expert cache of at least "
-+                           "3*n_expert_used slots (have %u, need %u); increase --moe-stream-cache or reduce -ub",
-+                        msl->n_slots, 3*(uint32_t) n_expert_used);
++                           "%u*n_expert_used slots (have %u, need %u); increase --moe-stream-cache, reduce -ub, "
++                           "or set LLAMA_MOE_STREAM_WAVE_PRELOAD=0",
++                        msl->mgr->wave_preload ? 3u : 2u, msl->n_slots, (msl->mgr->wave_preload ? 3u : 2u)*(uint32_t) n_expert_used);
 +            }
 +            n_stream_waves = (uint32_t) ((n_touch_max + stream_wave_cap - 1)/stream_wave_cap);
 +        }
@@ -628,7 +633,7 @@ index 23e4c90..de5ffe8 100644
  
      cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
  
-@@ -2223,12 +2317,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2223,12 +2322,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          cb(cur, "ffn_moe_weighted", il);
      }
  
@@ -648,7 +653,7 @@ index 23e4c90..de5ffe8 100644
          cb(gate_up, "ffn_moe_gate_up", il);
  
          if (up_exps_s) {
-@@ -2247,7 +2347,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2247,7 +2352,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          cb(up, "ffn_moe_up", il);
      } else {
          // separate gate and up path
@@ -657,7 +662,7 @@ index 23e4c90..de5ffe8 100644
          cb(up, "ffn_moe_up", il);
  
          if (up_exps_s) {
-@@ -2260,7 +2360,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2260,7 +2365,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          }
  
          if (gate_exps) {
@@ -666,7 +671,7 @@ index 23e4c90..de5ffe8 100644
              cb(cur, "ffn_moe_gate", il);
          } else {
              cur = up;
-@@ -2361,7 +2461,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2361,7 +2466,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
              GGML_ABORT("fatal error");
      }
  
@@ -675,7 +680,7 @@ index 23e4c90..de5ffe8 100644
      if (arch == LLM_ARCH_MISTRAL4) {
          // src1 can exceed F16 range
          ggml_prec_set_src(experts, GGML_PREC_F32, 1);
-@@ -2377,6 +2477,81 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2377,6 +2482,81 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          cb(experts, "ffn_moe_down_biased", il);
      }
  
@@ -1193,10 +1198,10 @@ index 8212447..94700e5 100644
      virtual ~llama_model_base() = default;
 diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
 new file mode 100644
-index 0000000..2d5a890
+index 0000000..b8e0b6e
 --- /dev/null
 +++ b/src/llama-moe-stream.cpp
-@@ -0,0 +1,2111 @@
+@@ -0,0 +1,2186 @@
 +#include "llama-moe-stream.h"
 +
 +#include "llama-impl.h"
@@ -1538,6 +1543,9 @@ index 0000000..2d5a890
 +    if (const char * e = std::getenv("LLAMA_MOE_STREAM_PREFETCH_POOL")) {
 +        prefetch_pool = std::max(0, atoi(e));
 +    }
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_WAVE_PRELOAD")) {
++        wave_preload = strcmp(e, "0") != 0;
++    }
 +    prefetch_dry = std::getenv("LLAMA_MOE_STREAM_PREFETCH_DRY") != nullptr;
 +    if (const char * e = std::getenv("LLAMA_MOE_STREAM_STAGE_CACHE")) {
 +        stage_use_cache = strcmp(e, "0") != 0;
@@ -1545,9 +1553,15 @@ index 0000000..2d5a890
 +    if (const char * e = std::getenv("LLAMA_MOE_STREAM_STAGE_COPY_THREADS")) {
 +        n_copy_threads = std::clamp(atoi(e), 1, 16);
 +    }
++    if (const char * e = std::getenv("LLAMA_MOE_STREAM_STAGE_MAX_KB")) {
++        const size_t kb = (size_t) std::max(64L, atol(e));
++        stage_chunk_max = (kb*1024 + MOE_STREAM_DIRECT_ALIGN - 1) & ~(MOE_STREAM_DIRECT_ALIGN - 1);
++    }
 +    if (const char * e = std::getenv("LLAMA_MOE_STREAM_STAGE_MIN_KB")) {
 +        const size_t kb = (size_t) std::max(4L, atol(e));
 +        stage_chunk_min = std::min(stage_chunk_max, (kb*1024 + MOE_STREAM_DIRECT_ALIGN - 1) & ~(MOE_STREAM_DIRECT_ALIGN - 1));
++    } else {
++        stage_chunk_min = std::min(stage_chunk_min, stage_chunk_max);
 +    }
 +
 +    if (const char * e = std::getenv("LLAMA_MOE_STREAM_GPU_MIB")) {
@@ -3118,6 +3132,43 @@ index 0000000..2d5a890
 +                // miss: evict a non-kept slot and queue the load
 +                int32_t v;
 +                while ((v = pick_victim_locked(sl, sl.keep.data())) < 0) {
++                    // safety net: every slot is keep-protected (this wave's hits, borrowed parking,
++                    //   next-wave residents, decode wrap-around prefetch) and nothing is loading, so
++                    //   nobody will ever notify. sacrifice a protected resident outside this wave's
++                    //   demand set - it becomes a demand load for its wave instead of a hang
++                    bool any_loading = false;
++                    for (uint32_t s = 0; s < sl.n_slots; s++) {
++                        if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
++                            any_loading = true;
++                            break;
++                        }
++                    }
++                    if (!any_loading) {
++                        int32_t sac = -1;
++                        uint32_t hot = UINT32_MAX;
++                        for (uint32_t s = 0; s < sl.n_slots; s++) {
++                            if (sl.slot_state[s] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
++                                continue;
++                            }
++                            const bool needed = std::find(sl.demand_slots.begin(), sl.demand_slots.end(), (int32_t) s) != sl.demand_slots.end()
++                                || std::find(borrowed.begin(), borrowed.end(), (int32_t) s) != borrowed.end();
++                            if (needed || sl.route_hotness[sl.slot_expert[s]] >= hot) {
++                                continue;
++                            }
++                            hot = sl.route_hotness[sl.slot_expert[s]];
++                            sac = (int32_t) s;
++                        }
++                        if (sac >= 0) {
++                            static std::atomic<int> warned{0};
++                            if (warned.fetch_add(1) < 3) {
++                                LLAMA_LOG_WARN("moe stream: layer %d wave %d: all %u slots protected with no load in flight, "
++                                        "evicting protected expert %d (next wave demand-loads it)\n",
++                                        sl.il, w, sl.n_slots, sl.slot_expert[sac]);
++                            }
++                            v = sac;
++                            break;
++                        }
++                    }
 +                    cv_done.wait(lk);
 +                    if (load_failed) {
 +                        GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
@@ -3160,7 +3211,7 @@ index 0000000..2d5a890
 +
 +    if (waited) {
 +        const int64_t t0 = ggml_time_us();
-+        cv_done.wait(lk, [&]{
++        while (!cv_done.wait_for(lk, std::chrono::seconds(5), [&]{
 +            if (load_failed) {
 +                return true;
 +            }
@@ -3170,7 +3221,36 @@ index 0000000..2d5a890
 +                }
 +            }
 +            return true;
-+        });
++        })) {
++            if (load_failed) {
++                GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
++            }
++            // safety net: a demand slot is stuck LOADING while no worker holds work for it - a lost
++            //   work item would idle the pool forever. clear the claimed bits so every part of the
++            //   stuck slots is re-queued (the per-part dedup only works if the bits are cleared)
++            bool any_loading = false;
++            for (uint32_t s = 0; s < sl.n_slots; s++) {
++                if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
++                    any_loading = true;
++                    break;
++                }
++            }
++            if (!any_loading || !q_demand.empty() || !q_prefetch.empty()) {
++                continue; // work is still moving (or queued): keep waiting
++            }
++            int n_requeue = 0;
++            for (const int32_t s : sl.demand_slots) {
++                if (sl.slot_state[s] != LLAMA_MOE_STREAM_SLOT_RESIDENT && sl.slot_expert[s] >= 0) {
++                    sl.slot_claimed[s] = 0;
++                    enqueue_load_locked(sl, sl.slot_expert[s], s);
++                    n_requeue++;
++                }
++            }
++            if (n_requeue > 0) {
++                LLAMA_LOG_WARN("moe stream: layer %d wave %d: %d demand slot(s) stuck loading with idle workers, re-queued\n",
++                        sl.il, w, n_requeue);
++            }
++        }
 +        if (load_failed) {
 +            GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
 +        }
@@ -3310,10 +3390,10 @@ index 0000000..2d5a890
 +}
 diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
 new file mode 100644
-index 0000000..0ba9422
+index 0000000..da9b211
 --- /dev/null
 +++ b/src/llama-moe-stream.h
-@@ -0,0 +1,448 @@
+@@ -0,0 +1,450 @@
 +#pragma once
 +
 +#include "ggml-backend.h"
@@ -3690,6 +3770,8 @@ index 0000000..0ba9422
 +    int32_t prefetch_n    = 0;
 +    int32_t prefetch_pool = 1;     // 1 = only the mirror's demand workers take prefetches (LLAMA_MOE_STREAM_PREFETCH_POOL, 0 = all)
 +    bool    prefetch_dry  = false; // LLAMA_MOE_STREAM_PREFETCH_DRY: predict but load nothing (diagnostic)
++    bool    wave_preload  = true;  // multi-wave GEMMs reserve spare/2 slots to preload the next wave while one computes;
++                                  // 0 halves the slot floor to 2*n_expert_used (LLAMA_MOE_STREAM_WAVE_PRELOAD, small-RAM boxes)
 +
 +    std::vector<std::thread> workers;
 +    bool workers_started = false;
